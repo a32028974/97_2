@@ -141,6 +141,81 @@ async function _obtenerNumeroDisponible(nroDeseado) {
   return candidato;
 }
 
+// ===== Fingerprint (EXACT MATCH por contenido) =====
+const _NK = (k) => String(k||'')
+  .normalize('NFD').replace(/\p{Diacritic}/gu,'')
+  .toUpperCase().replace(/[^A-Z0-9]+/g,'_')
+  .replace(/^_|_$/g,'');
+
+function _buildKeyMap(row){ const K={}; for(const [k,v] of Object.entries(row||{})) K[_NK(k)]=v; return K; }
+function _gv(K, aliases){ for(const a of [].concat(aliases)){ const v=K[_NK(a)]; if(v!=null && v!=='') return v; } return ''; }
+
+function _normStr(s){ return String(s||'').normalize('NFD').replace(/\p{Diacritic}/gu,'').toUpperCase().trim(); }
+function _normNum(s){ const n = Number(String(s||'').replace(/[^\d\.\-]/g,'')); return Number.isFinite(n) ? n : 0; }
+
+// Canon del formulario (qué comparamos)
+function _canonFromForm(){
+  const V = (id) => (document.getElementById(id)?.value ?? '').toString().trim();
+  const money = (id)=> _normNum(V(id));
+  return {
+    dni: _normStr(V('dni')),
+    nombre: _normStr(V('nombre')),
+    cristal: _normStr(V('cristal')),
+    n_armazon: _normStr(V('numero_armazon')),
+    armazon_detalle: _normStr(V('armazon_detalle')),
+    otro_txt: _normStr(V('otro_concepto')),
+    dist: _normStr(V('distancia_focal')),
+    od_esf: _normStr(V('od_esf')), od_cil: _normStr(V('od_cil')), od_eje: _normStr(V('od_eje')),
+    oi_esf: _normStr(V('oi_esf')), oi_cil: _normStr(V('oi_cil')), oi_eje: _normStr(V('oi_eje')),
+    dnp: _normStr(V('dnp')), add: _normStr(V('add')),
+    total: money('total'), sena: money('sena'), saldo: money('saldo')
+  };
+}
+
+// Canon desde una fila del historial (alias flexibles)
+function _canonFromRow(row){
+  const K = _buildKeyMap(row);
+  const money = (aliases)=> _normNum(_gv(K, aliases));
+  return {
+    dni: _normStr(_gv(K, ['DNI','DOCUMENTO','DOC'])),
+    nombre: _normStr(_gv(K, ['NOMBRE','CLIENTE','APELLIDO_NOMBRE','APELLIDO_Y_NOMBRE','APENOM'])),
+    cristal: _normStr(_gv(K, ['CRISTAL'])),
+    n_armazon: _normStr(_gv(K, ['NUMERO_ARMAZON','N_ARMAZON','NUM_ARMAZON','ARMAZON','ARMAZON_NUMERO','NRO_ARMAZON'])),
+    armazon_detalle: _normStr(_gv(K, ['DETALLE_ARMAZON','ARMAZON_DETALLE'])),
+    otro_txt: _normStr(_gv(K, ['OTRO','CONCEPTO_OTRO'])),
+    dist: _normStr(_gv(K, ['DISTANCIA_FOCAL','DISTANCIA'])),
+    od_esf: _normStr(_gv(K, ['OD_ESF','ESF_OD','OD_ESFERA'])),
+    od_cil: _normStr(_gv(K, ['OD_CIL','CIL_OD','OD_CILINDRO'])),
+    od_eje: _normStr(_gv(K, ['OD_EJE','EJE_OD'])),
+    oi_esf: _normStr(_gv(K, ['OI_ESF','ESF_OI','OI_ESFERA'])),
+    oi_cil: _normStr(_gv(K, ['OI_CIL','CIL_OI','OI_CILINDRO'])),
+    oi_eje: _normStr(_gv(K, ['OI_EJE','EJE_OI'])),
+    dnp: _normStr(_gv(K, ['DNP','DNP_OD_OI'])),
+    add: _normStr(_gv(K, ['ADD'])),
+    total: money(['TOTAL','TOTAL_FINAL']),
+    sena: money(['SEÑA','SENA']),
+    saldo: money(['SALDO'])
+  };
+}
+
+function _canonEquals(a,b){ for (const k of Object.keys(a)) if (a[k] !== b[k]) return false; return true; }
+
+async function _findExactMatchForBase(base, canonNow){
+  // Buscar filas que empiecen con base o base-*
+  let rows = await _queryHist({ histBuscar: `@${base}`, limit: 200 });
+  if (!rows.length) rows = await _queryHist({ histBuscar: base, limit: 200 });
+  for (const r of rows){
+    try{
+      const nro = _extractNro(r);
+      if (!nro || !(nro === base || nro.startsWith(base+'-'))) continue;
+      const c = _canonFromRow(r);
+      if (_canonEquals(c, canonNow)) return { row:r, numero:nro };
+    }catch{}
+  }
+  return null;
+}
+
+
 /* ===== Flujo principal ===== */
 export async function guardarTrabajo({ progress } = {}) {
   const spinner = $("spinner");
@@ -178,68 +253,101 @@ export async function guardarTrabajo({ progress } = {}) {
     } catch { /* si falla, seguimos con el ingresado */ }
     setStep("Validando número", "done");
 
+// ==== DEDUPE PRE-GUARDADO ====
+// Si ya existe un registro con la misma base y contenido idéntico,
+// NO crear otro (evita 12345-1 por reintentos idénticos).
+const { base } = _splitBaseSuf(nroFinalCliente);
+const canonNow = _canonFromForm();
+
+let numeroFinal = null;
+const match = await _findExactMatchForBase(base, canonNow);
+if (match) {
+  // Ya existe idéntico → usamos ese número y saltamos el POST
+  numeroFinal = match.numero;
+  setNumeroTrabajo(numeroFinal);
+  // Marcamos el paso como hecho (ya está guardado)
+  setStep("Guardando en planilla", "done");
+} else {
+  // seguimos con el flujo normal (POST) más abajo
+}
+
+    
     // 1) Guardar en planilla (POST)
     setStep("Guardando en planilla", "run");
-    const formEl = $("formulario");
-    if (!formEl) throw new Error("Formulario no encontrado");
+const formEl = $("formulario");
+if (!formEl) throw new Error("Formulario no encontrado");
 
-    const fd = new FormData(formEl);
-    const body = new URLSearchParams(fd);
-    // ===== LOCALIDAD =====
-    const loc = (fd.get("localidad") || "").toString().trim();
-    body.set("localidad", loc);   // nombre del input
-    body.set("LOCALIDAD", loc);   // alias por encabezado de la hoja (columna AH)
+const fd = new FormData(formEl);
+const body = new URLSearchParams(fd);
 
-    // Forzamos el número final decidido del lado cliente
-    body.set("numero_trabajo", nroFinalCliente);
-    body.set("numero", nroFinalCliente); // alias común en GAS
+// LOCALIDAD normalizada
+const loc = (fd.get("localidad") || "").toString().trim();
+body.set("localidad", loc);
+body.set("LOCALIDAD", loc);
 
-    // ===== Armazón: número y detalle (FIX) =====
-    const numAr = (fd.get("numero_armazon") || "").toString().trim();
-    const detAr = (fd.get("armazon_detalle") || "").toString().trim();
+// Forzamos el número final decidido del lado cliente
+body.set("numero_trabajo", nroFinalCliente);
+body.set("numero", nroFinalCliente); // alias común en GAS
 
-    // Campos del NÚMERO (todas las variantes que puede entender tu GAS)
-    body.set("numero_armazon", numAr);
-    body.set("n_armazon", numAr);
-    body.set("num_armazon", numAr);
-    body.set("nro_armazon", numAr);
-    body.set("armazon_numero", numAr);
-    body.set("NUMERO ARMAZON", numAr);
+// ========= Armazón (número + detalle) =========
+const numAr = (fd.get("numero_armazon") || "").toString().trim();
+const detAr = (fd.get("armazon_detalle") || "").toString().trim();
 
-    // Compat GAS antiguo: 'armazon' lo trata como NÚMERO (fallback)
-    // → nunca mandamos el detalle acá; si no hay número, lo dejamos vacío.
-    body.set("armazon", numAr || "");
+// Variantes que tu GAS entiende
+body.set("numero_armazon", numAr);
+body.set("n_armazon", numAr);
+body.set("num_armazon", numAr);
+body.set("nro_armazon", numAr);
+body.set("armazon_numero", numAr);
+body.set("NUMERO ARMAZON", numAr);
 
-    // Campos del DETALLE
-    body.set("armazon_detalle", detAr);
-    body.set("detalle_armazon", detAr);
-    body.set("DETALLE ARMAZON", detAr);
-    body.set("ARMAZON", detAr);
+// Compat viejo (ARMAZON = NÚMERO)
+body.set("armazon", numAr || "");
 
-    // ===== Alias para Distancia / Obra Social =====
-    const distFocal = (fd.get("distancia_focal") || "").toString().trim();
-    const obraSoc   = (fd.get("obra_social") || "").toString().trim();
-    const precioOS  = (fd.get("importe_obra_social") || "").toString().trim();
+// Detalle
+body.set("armazon_detalle", detAr);
+body.set("detalle_armazon", detAr);
+body.set("DETALLE ARMAZON", detAr);
+body.set("ARMAZON", detAr);
 
-    // ids “normales” del form
-    body.set("distancia_focal", distFocal);
-    body.set("obra_social", obraSoc);
-    body.set("importe_obra_social", precioOS);
+// Alias DF / Obra Social
+const distFocal = (fd.get("distancia_focal") || "").toString().trim();
+const obraSoc   = (fd.get("obra_social") || "").toString().trim();
+const precioOS  = (fd.get("importe_obra_social") || "").toString().trim();
 
-    // encabezados que suele usar la planilla
-    body.set("DISTANCIA FOCAL", distFocal);
-    body.set("OBRA SOCIAL", obraSoc);
-    body.set("PRECIO OBRA SOCIAL", precioOS);
-    body.set("- DESCUENTA OBRA SOCIAL", precioOS);
+body.set("distancia_focal", distFocal);
+body.set("obra_social", obraSoc);
+body.set("importe_obra_social", precioOS);
+body.set("DISTANCIA FOCAL", distFocal);
+body.set("OBRA SOCIAL", obraSoc);
+body.set("PRECIO OBRA SOCIAL", precioOS);
+body.set("- DESCUENTA OBRA SOCIAL", precioOS);
 
-    const postJson = await postForm(API_URL, body);
+try{
+  if (!numeroFinal) {
+    const postJson = await postForm(API_URL, body); // POST normal
     setStep("Guardando en planilla", "done");
-
-    // Número definitivo que pudo devolver el backend (por colisiones simultáneas)
-    const numeroFinal = (postJson && postJson.numero_trabajo)
+    numeroFinal = (postJson && postJson.numero_trabajo)
       ? String(postJson.numero_trabajo).trim()
       : nroFinalCliente;
-    setNumeroTrabajo(numeroFinal);
+  }
+} catch(e){
+  // Si hubo timeout/error de red, chequeamos si igualmente se grabó una fila idéntica
+  if (/espera|conectar|red/i.test(String(e.message))) {
+    const rescue = await _findExactMatchForBase(base, canonNow);
+    if (rescue) {
+      numeroFinal = rescue.numero; // se guardó igual → seguimos
+      setStep("Guardando en planilla", "done");
+    } else {
+      throw e; // no se creó nada → error real
+    }
+  } else {
+    throw e;
+  }
+}
+
+// Número definitivo a pantalla
+setNumeroTrabajo(numeroFinal);
 
     // 2) PACK (PDF + Telegram)
     setStep("Generando PDF", "run");

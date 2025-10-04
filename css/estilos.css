@@ -4,7 +4,7 @@
 
 /* ========== Variables y base ========== */
 :root{
-  --bg:#c4FFFF; --card:#fff; --text:#1f2937; --muted:#6b7280; --line:#e5e7eb;
+  --bg:#f5f7fb; --card:#fff; --text:#1f2937; --muted:#6b7280; --line:#e5e7eb;
   --brand:#1b64f2; --brand-600:#1857d3; --ok:#10b981; --warn:#f59e0b; --danger:#ef4444;
   --radius:16px; --shadow:0 14px 40px rgba(0,0,0,.08);
   --gap:12px;
